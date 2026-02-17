@@ -7,3 +7,4 @@ Contains:
 - semgrep triggers
 - gitleaks triggers
 - incremental change testing
+- final stage decision to merge
