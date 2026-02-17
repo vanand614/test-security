@@ -1,0 +1,146 @@
+name: ClaimCenter Security Pipeline (TEST)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      BASE_BRANCH: main
+
+    steps:
+
+    # -------------------------------------------------
+    # Checkout full history (required for diff)
+    # -------------------------------------------------
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # -------------------------------------------------
+    # Detect changed files from previous commit
+    # -------------------------------------------------
+    - name: Get changed files
+      id: diff
+      run: |
+        git diff --name-only HEAD~1 HEAD > changed_files.txt || true
+
+        echo "Changed files:"
+        cat changed_files.txt || echo "None"
+
+    # -------------------------------------------------
+    # Install tools (stable install method)
+    # -------------------------------------------------
+    - name: Install Semgrep
+      run: pip install semgrep
+
+    - name: Install Gitleaks
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget tar jq
+
+        wget https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_8.18.2_linux_x64.tar.gz
+        tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+        sudo mv gitleaks /usr/local/bin/
+        sudo chmod +x /usr/local/bin/gitleaks
+
+        gitleaks version
+
+    # -------------------------------------------------
+    # Run Semgrep (only on changed files)
+    # -------------------------------------------------
+    - name: Run Semgrep incremental
+      run: |
+        if [ -s changed_files.txt ]; then
+          semgrep scan --config=auto \
+            --json -o semgrep-report.json \
+            $(cat changed_files.txt) || true
+        else
+          echo "{}" > semgrep-report.json
+        fi
+
+    # -------------------------------------------------
+    # Run Gitleaks
+    # -------------------------------------------------
+    - name: Run Gitleaks
+      run: |
+        gitleaks detect \
+          --no-git \
+          --source . \
+          --report-format json \
+          --report-path gitleaks-report.json || true
+
+    # -------------------------------------------------
+    # Aggregate results safely
+    # -------------------------------------------------
+    - name: Aggregate findings
+      id: agg
+      run: |
+        SEMGREP=$(jq '.results | length' semgrep-report.json 2>/dev/null || echo 0)
+        GITLEAKS=$(jq 'length' gitleaks-report.json 2>/dev/null || echo 0)
+
+        TOTAL=$((SEMGREP + GITLEAKS))
+
+        echo "Semgrep findings: $SEMGREP"
+        echo "Gitleaks findings: $GITLEAKS"
+        echo "Total findings: $TOTAL"
+
+        echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+    # -------------------------------------------------
+    # Generate HTML dashboard
+    # -------------------------------------------------
+    - name: Generate HTML report
+      run: |
+        mkdir -p site
+
+        echo "<html><body>" > site/index.html
+        echo "<h1>ClaimCenter Security Dashboard (TEST)</h1>" >> site/index.html
+
+        echo "<h2>Changed Files</h2><pre>" >> site/index.html
+        cat changed_files.txt >> site/index.html || echo "None" >> site/index.html
+        echo "</pre>" >> site/index.html
+
+        echo "<h2>Semgrep Findings</h2><ul>" >> site/index.html
+        jq -r '.results[]? | "<li>\(.path) - \(.extra.message)</li>"' semgrep-report.json >> site/index.html || true
+        echo "</ul>" >> site/index.html
+
+        echo "<h2>Gitleaks Findings</h2><ul>" >> site/index.html
+        jq -r '.[]? | "<li>\(.File) - \(.Description)</li>"' gitleaks-report.json >> site/index.html || true
+        echo "</ul></body></html>" >> site/index.html
+
+    # -------------------------------------------------
+    # Upload artifacts (always)
+    # -------------------------------------------------
+    - name: Upload Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: claimcenter-test-reports
+        path: |
+          semgrep-report.json
+          gitleaks-report.json
+          site/index.html
+          changed_files.txt
+
+  # -------------------------------------------------
+  # FINAL GATE (ONLY FAILURE POINT)
+  # -------------------------------------------------
+  final-gate:
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if findings exist
+        run: |
+          if [ "${{ needs.security-scan.outputs.total }}" != "" ] && [ "${{ needs.security-scan.outputs.total }}" -gt 0 ]; then
+            echo "Security findings detected → failing pipeline"
+            exit 1
+          else
+            echo "Security gate passed"
+          fi
