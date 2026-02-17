@@ -1,7 +1,7 @@
 name: ClaimCenter Security Pipeline (TEST)
 
 on:
-  push:
+  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
